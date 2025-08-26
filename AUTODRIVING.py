@@ -1,138 +1,116 @@
 #!/usr/bin/env python3
-# 树莓派5 + IMX219 相机（Picamera2）
-# 功能：仅相机自动驾驶 —— 指定颜色避让 + 地面可通行区域引导
-# 驱动：L298N（差速）
-# 说明：使用 Picamera2 低延迟视频流；先自动曝光/白平衡，稳定后锁定，降低 HSV 偏移
+# Pi5 + IMX219：仅相机导航；通过串口把左右轮速度发给 Arduino Nano
+# 协议：每帧发送 "S <L> <R>\n" ，范围 -255..255
 
-import cv2, numpy as np, time, sys, signal
-import RPi.GPIO as GPIO
+import cv2, numpy as np, time, sys, signal, serial
 from picamera2 import Picamera2
 
-############################################
-# === 配置（可按场地/小车微调） ===
-############################################
-# 图像尺寸/帧率（IMX219 支持更高分辨率，这里用 640x360 以降低延迟与算力）
+# ======== 参数 ========
 FRAME_W, FRAME_H = 640, 360
 FPS_LIMIT = 30
-SHOW_DEBUG = False            # 有显示器时可设 True 以便调参
+SHOW_DEBUG = False
 
-# 颜色避障（从 HSV_RANGES 的键里选）
 TARGET_COLORS = ["red", "blue"]
-
-# HSV 范围（需按现场光照微调；红色跨 0/179 需两段）
 HSV_RANGES = {
     "red":    [((0, 100, 80),  (10, 255, 255)), ((170, 90, 80), (179, 255, 255))],
     "blue":   [((95,  80, 80), (130, 255, 255))],
     "yellow": [((18, 120, 80), (35,  255, 255))],
     "green":  [((40,  70, 60), (85,  255, 255))]
 }
-FOCUS_BAND_Y0 = 0.45         # 仅分析图像底部 55%（0..1）
-AREA_MIN_PIXELS = 1500       # 色块面积小于此值忽略
-CENTER_DEAD_BAND = 0.08      # 近中心时给更强推离
+FOCUS_BAND_Y0 = 0.45
+AREA_MIN_PIXELS = 1500
+CENTER_DEAD_BAND = 0.08
 
-# 地面学习（用于可通行区域引导）
-ROI_FLOOR_Y = 0.85           # 取底部 15% 采样为地面
+ROI_FLOOR_Y = 0.85
 HSV_TOL_H, HSV_TOL_S, HSV_TOL_V = 18, 60, 60
-FLOOR_BLOCK_THRESH = 0.08     # 下半区“地面像素占比”低于此 → 认为阻塞
-FLOOR_HARD_BLOCK  = 0.03      # 极低占比 → 短促倒退
+FLOOR_BLOCK_THRESH = 0.08
+FLOOR_HARD_BLOCK  = 0.03
 
-# 电机（L298N 引脚）
-PWM_FREQ = 1000
-LEFT_IN1, LEFT_IN2, LEFT_EN   = 20, 21, 12
-RIGHT_IN1, RIGHT_IN2, RIGHT_EN = 19, 26, 13
-
-# 控制参数
+# 运动学参数（保持与原程序一致）
 BASE_SPEED = 0.55
 STEER_GAIN = 0.55
 SMOOTH_ALPHA = 0.4
-COLOR_WEIGHT = 0.7            # 颜色避障与地面引导的融合权重
-SLOW_BY_COLOR = 0.7           # 检到颜色障碍时整体降速系数
-REVERSE_SPEED = -0.35         # 极端阻塞倒退速度
-REVERSE_TIME  = 0.25          # 倒退时间（秒）
+COLOR_WEIGHT = 0.7
+SLOW_BY_COLOR = 0.7
+REVERSE_SPEED = -0.35
+REVERSE_TIME  = 0.25
 
-############################################
-# === 电机驱动（差速） ===
-############################################
-class DualMotor:
-    def __init__(self):
-        GPIO.setmode(GPIO.BCM)
-        for p in [LEFT_IN1, LEFT_IN2, LEFT_EN, RIGHT_IN1, RIGHT_IN2, RIGHT_EN]:
-            GPIO.setup(p, GPIO.OUT)
-        self.pl = GPIO.PWM(LEFT_EN, PWM_FREQ);  self.pl.start(0)
-        self.pr = GPIO.PWM(RIGHT_EN, PWM_FREQ); self.pr.start(0)
-        self._l, self._r = 0.0, 0.0
+# 串口：Nano 可能是 /dev/ttyACM0（ATmega16u2）或 /dev/ttyUSB0（CH340/FT232）
+SERIAL_PORT = "/dev/ttyACM0"
+BAUDRATE = 115200
+SEND_HZ = 50
 
-    def _drive_one(self, in1, in2, pwm, value):
-        # value ∈ [-1,1]；正前进、负后退
-        v = max(-1.0, min(1.0, float(value)))
-        if v >= 0:
-            GPIO.output(in1, 1); GPIO.output(in2, 0)
-            pwm.ChangeDutyCycle(100*v)
-        else:
-            GPIO.output(in1, 0); GPIO.output(in2, 1)
-            pwm.ChangeDutyCycle(100*(-v))
-
-    def drive(self, left, right):
-        # 一阶平滑，降低抖动
-        self._l = 0.6*self._l + 0.4*left
-        self._r = 0.6*self._r + 0.4*right
-        self._drive_one(LEFT_IN1, LEFT_IN2, self.pl, self._l)
-        self._drive_one(RIGHT_IN1, RIGHT_IN2, self.pr, self._r)
-
-    def stop(self):
-        try:
-            self.drive(0,0); time.sleep(0.05)
-            self.pl.stop(); self.pr.stop()
-            for p in [LEFT_IN1, LEFT_IN2, RIGHT_IN1, RIGHT_IN2]:
-                GPIO.output(p, 0)
-            GPIO.cleanup()
-        except: pass
-
-############################################
-# === Picamera2 相机封装（IMX219） ===
-############################################
+# ======== 相机封装 ========
 class IMX219Camera:
-    """使用 Picamera2 采集帧（RGB888），并转换为 OpenCV BGR"""
     def __init__(self, width=FRAME_W, height=FRAME_H, fps=FPS_LIMIT):
         self.picam2 = Picamera2()
         cfg = self.picam2.create_video_configuration(
             main={"size": (width, height), "format": "RGB888"},
-            controls={
-                "FrameDurationLimits": (int(1e6//fps), int(1e6//fps)),  # 固定帧间隔
-            }
+            controls={"FrameDurationLimits": (int(1e6//fps), int(1e6//fps))}
         )
         self.picam2.configure(cfg)
         self.picam2.start()
-        # 先让 AE/AWB 工作一小段时间以稳定
         time.sleep(1.5)
         try:
             md = self.picam2.capture_metadata()
-            # 锁定当前的曝光/白平衡，减少 HSV 漂移
             controls = {"AeEnable": False, "AwbEnable": False}
-            if "ExposureTime" in md: controls["ExposureTime"] = md["ExposureTime"]
-            if "AnalogueGain" in md: controls["AnalogueGain"] = md["AnalogueGain"]
-            if "ColourGains" in md:  controls["ColourGains"]  = md["ColourGains"]
+            if "ExposureTime" in md:  controls["ExposureTime"] = md["ExposureTime"]
+            if "AnalogueGain" in md:  controls["AnalogueGain"]  = md["AnalogueGain"]
+            if "ColourGains" in md:   controls["ColourGains"]   = md["ColourGains"]
             self.picam2.set_controls(controls)
         except Exception as e:
-            print("[相机] 锁定 AE/AWB 失败，继续使用自动模式：", e)
+            print("[相机] AE/AWB 锁定失败：", e)
 
     def grab_bgr(self):
-        # Picamera2 返回 RGB；转为 BGR 给 OpenCV
-        frame_rgb = self.picam2.capture_array()
-        return cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        rgb = self.picam2.capture_array()
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
     def stop(self):
         try: self.picam2.stop()
         except: pass
 
-############################################
-# === 地面颜色学习（开机短采样） ===
-############################################
-def learn_floor_hsv(get_frame_bgr, n_frames=25):
-    """get_frame_bgr 为无参函数，返回一帧 BGR"""
+# ======== 串口电机封装 ========
+class SerialMotor:
+    """把 [-1,1] 左右速度映射为 -255..255，经串口发给 Nano"""
+    def __init__(self, port=SERIAL_PORT, baud=BAUDRATE, send_hz=SEND_HZ):
+        self.ser = serial.Serial(port, baudrate=baud, timeout=0.02)
+        self.last_send = 0.0
+        self.dt = 1.0 / float(send_hz)
+        time.sleep(0.5)  # 等待 Nano 复位
+        self.ser.reset_input_buffer(); self.ser.reset_output_buffer()
+        # 可读取 READY
+        try:
+            rd = self.ser.readline().decode(errors='ignore').strip()
+            if rd: print("[Nano]", rd)
+        except: pass
+
+    def drive(self, left, right):
+        now = time.time()
+        if now - self.last_send < self.dt:
+            return
+        self.last_send = now
+        # 映射 [-1,1] -> [-255,255]
+        def mapv(v):
+            v = max(-1.0, min(1.0, float(v)))
+            return int(round(v * 255.0))
+        L = mapv(left); R = mapv(right)
+        cmd = f"S {L} {R}\n"
+        try:
+            self.ser.write(cmd.encode())
+        except Exception as e:
+            print("[串口] 写入失败：", e)
+
+    def stop(self):
+        try:
+            self.ser.write(b"S 0 0\n")
+            self.ser.close()
+        except: pass
+
+# ======== 工具函数（与原相同逻辑） ========
+def learn_floor_hsv(get_bgr, n_frames=25):
     hs, ss, vs = [], [], []
     for _ in range(n_frames):
-        frame = get_frame_bgr()
+        frame = get_bgr()
         if frame is None: continue
         frame = cv2.resize(frame, (FRAME_W, FRAME_H))
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -140,125 +118,76 @@ def learn_floor_hsv(get_frame_bgr, n_frames=25):
         roi = hsv[y0:FRAME_H, :]
         h,s,v = cv2.split(roi)
         hs.append(np.median(h)); ss.append(np.median(s)); vs.append(np.median(v))
-    if len(hs)==0:
-        # 兜底（不建议）：全通过
-        return (0,0,0), (179,255,255)
+    if not hs: return (0,0,0), (179,255,255)
     h0,s0,v0 = np.median(hs), np.median(ss), np.median(vs)
     lower = (max(0, h0-HSV_TOL_H), max(0, s0-HSV_TOL_S), max(0, v0-HSV_TOL_V))
     upper = (min(179, h0+HSV_TOL_H), min(255, s0+HSV_TOL_S), min(255, v0+HSV_TOL_V))
     return tuple(map(int, lower)), tuple(map(int, upper))
 
-############################################
-# === 颜色避障方向估计 ===
-############################################
 def color_avoid_dir(frame_bgr):
-    """
-    返回 (steer_away, seen, vis, area_norm)
-    - steer_away ∈ [-1,1]：正→向右转（障碍在左）
-    - seen：是否检测到目标颜色
-    - area_norm：色块占下半区比例（0..1）
-    """
     frame = cv2.resize(frame_bgr, (FRAME_W, FRAME_H))
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     y0 = int(FRAME_H*FOCUS_BAND_Y0)
     roi = hsv[y0:, :]
-
-    mask_total = np.zeros((roi.shape[0], roi.shape[1]), dtype=np.uint8)
+    mask = np.zeros((roi.shape[0], roi.shape[1]), dtype=np.uint8)
     for cname in TARGET_COLORS:
         for (lo, hi) in HSV_RANGES[cname]:
-            mask_total |= cv2.inRange(roi, np.array(lo, np.uint8), np.array(hi, np.uint8))
-
-    mask_total = cv2.medianBlur(mask_total, 5)
-    kernel = np.ones((5,5), np.uint8)
-    mask_total = cv2.morphologyEx(mask_total, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    cnts, _ = cv2.findContours(mask_total, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    total_pixels = mask_total.size
+            mask |= cv2.inRange(roi, np.array(lo, np.uint8), np.array(hi, np.uint8))
+    mask = cv2.medianBlur(mask, 5)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5,5),np.uint8), iterations=2)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    total = mask.size
     area_norm = 0.0
-
     if not cnts:
-        if SHOW_DEBUG: return 0.0, False, cv2.cvtColor(roi, cv2.COLOR_HSV2BGR), 0.0
         return 0.0, False, None, 0.0
-
-    cnt = max(cnts, key=cv2.contourArea)
-    area = cv2.contourArea(cnt); area_norm = float(area/total_pixels)
+    c = max(cnts, key=cv2.contourArea)
+    area = cv2.contourArea(c); area_norm = float(area/total)
     if area < AREA_MIN_PIXELS:
-        if SHOW_DEBUG: return 0.0, False, cv2.cvtColor(roi, cv2.COLOR_HSV2BGR), area_norm
         return 0.0, False, None, area_norm
-
-    M = cv2.moments(cnt)
-    if M["m00"] == 0:
-        return 0.0, False, None, area_norm
+    M = cv2.moments(c)
+    if M["m00"] == 0: return 0.0, False, None, area_norm
     cx = int(M["m10"]/M["m00"])
-
-    nx = (cx - FRAME_W/2) / (FRAME_W/2)    # [-1,1]
-    steer_away = float(np.clip(-nx, -1, 1)) # 左侧障碍 → 右转（正）
-
-    if abs(nx) < CENTER_DEAD_BAND:
-        steer_away = float(np.sign(steer_away)) * 0.5
-
+    nx = (cx - FRAME_W/2) / (FRAME_W/2)
+    steer_away = float(np.clip(-nx, -1, 1))
+    if abs(nx) < CENTER_DEAD_BAND: steer_away = float(np.sign(steer_away))*0.5
     if SHOW_DEBUG:
         vis = frame.copy()
-        cv2.rectangle(vis, (0, y0), (FRAME_W-1, FRAME_H-1), (255,255,255), 1)
-        cv2.circle(vis, (int(cx), FRAME_H-5), 8, (0,0,255), -1)
-        cv2.putText(vis, f"color_steer={steer_away:+.2f} area%={area_norm*100:.1f}",
-                    (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+        cv2.rectangle(vis,(0,y0),(FRAME_W-1,FRAME_H-1),(255,255,255),1)
+        cv2.circle(vis,(int(cx),FRAME_H-5),8,(0,0,255),-1)
+        cv2.putText(vis, f"color_steer={steer_away:+.2f} area%={area_norm*100:.1f}", (10,30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
         return steer_away, True, vis, area_norm
     return steer_away, True, None, area_norm
 
-############################################
-# === 地面可通行区域引导（质心） ===
-############################################
-def floor_guidance(frame_bgr, hsv_floor_lower, hsv_floor_upper):
-    """
-    返回 (steer_floor, blocked, vis, cover_ratio)
-    - steer_floor ∈ [-1,1]：以“可通行区域”质心相对中心的偏移
-    - blocked：地面像素占比过低（认为受阻）
-    - cover_ratio：地面像素占比（0..1）
-    """
+def floor_guidance(frame_bgr, lower, upper):
     frame = cv2.resize(frame_bgr, (FRAME_W, FRAME_H))
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-    floor = cv2.inRange(hsv, np.array(hsv_floor_lower), np.array(hsv_floor_upper))
+    floor = cv2.inRange(hsv, np.array(lower), np.array(upper))
     floor = cv2.medianBlur(floor, 5)
-    kernel = np.ones((5,5), np.uint8)
-    floor = cv2.morphologyEx(floor, cv2.MORPH_CLOSE, kernel, iterations=2)
-
+    floor = cv2.morphologyEx(floor, cv2.MORPH_CLOSE, np.ones((5,5),np.uint8), iterations=2)
     bottom = floor[int(FRAME_H*0.45):, :]
-    cover_ratio = float(np.count_nonzero(bottom)/bottom.size)
-
+    cover = float(np.count_nonzero(bottom)/bottom.size)
     M = cv2.moments(bottom, binaryImage=True)
-    cx_global = FRAME_W//2
-    blocked = cover_ratio < FLOOR_BLOCK_THRESH
-
-    if M["m00"] > 1000:
-        cx_global = int(M["m10"]/M["m00"])
-    steer = (cx_global - FRAME_W/2)/(FRAME_W/2)
+    cx = FRAME_W//2
+    blocked = cover < FLOOr_BLOCK_THRESH if False else (cover < FLOOR_BLOCK_THRESH)
+    if M["m00"] > 1000: cx = int(M["m10"]/M["m00"])
+    steer = (cx - FRAME_W/2)/(FRAME_W/2)
     steer = float(np.clip(steer, -1, 1))
-
     if SHOW_DEBUG:
         vis = frame.copy()
-        cv2.line(vis, (FRAME_W//2, FRAME_H-1), (int(cx_global), FRAME_H-1), (0,255,0), 2)
-        txt = f"floor_steer={steer:+.2f} cover={cover_ratio*100:.1f}% blocked={int(blocked)}"
+        cv2.line(vis,(FRAME_W//2,FRAME_H-1),(int(cx),FRAME_H-1),(0,255,0),2)
+        txt = f"floor_steer={steer:+.2f} cover={cover*100:.1f}% blocked={int(blocked)}"
         cv2.putText(vis, txt, (10,60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,200,255), 2)
-        return steer, blocked, vis, cover_ratio
-    return steer, blocked, None, cover_ratio
+        return steer, blocked, vis, cover
+    return steer, blocked, None, cover
 
-############################################
-# === 主程序 ===
-############################################
 def main():
-    # 相机（IMX219 + Picamera2）
-    cam = IMX219Camera(width=FRAME_W, height=FRAME_H, fps=FPS_LIMIT)
+    cam = IMX219Camera(FRAME_W, FRAME_H, FPS_LIMIT)
+    print("[相机] 学习地面颜色中...")
+    low, up = learn_floor_hsv(cam.grab_bgr, 25)
+    print(f"[相机] 地面HSV：{low} ~ {up}")
 
-    # 地面颜色学习（请把车放在将要行驶的地面上）
-    print("[相机] 正在学习地面颜色...")
-    low, up = learn_floor_hsv(cam.grab_bgr, n_frames=25)
-    print(f"[相机] 地面 HSV 范围：lower={low}, upper={up}")
-
-    # 电机
-    motors = DualMotor(); time.sleep(0.3)
-
+    motors = SerialMotor(SERIAL_PORT, BAUDRATE)
     steer_cmd, speed_cmd = 0.0, 0.0
     last_info = time.time()
 
@@ -268,41 +197,28 @@ def main():
     try:
         while True:
             frame = cam.grab_bgr()
-            if frame is None:
-                print("[相机] 取帧失败"); break
-
-            # 1) 颜色避障方向 + 威胁面积
             steer_color, seen_color, vis_color, area_norm = color_avoid_dir(frame)
+            steer_floor, blocked, vis_floor, cover = floor_guidance(frame, low, up)
 
-            # 2) 地面可通行引导
-            steer_floor, blocked, vis_floor, cover_ratio = floor_guidance(frame, low, up)
-
-            # 3) 融合方向：有颜色障碍 → 按权重融合；否则纯地面引导
             steer = COLOR_WEIGHT*steer_color + (1.0-COLOR_WEIGHT)*steer_floor if seen_color else steer_floor
             steer = float(np.clip(steer, -1, 1))
 
-            # 4) 速度策略：基础速度 ×（颜色/阻塞系数）
             speed = BASE_SPEED
-            if seen_color:
-                speed *= SLOW_BY_COLOR * (1.0 - min(0.6, area_norm*2.0))
-            if blocked:
-                speed *= 0.6
+            if seen_color: speed *= SLOW_BY_COLOR * (1.0 - min(0.6, area_norm*2.0))
+            if blocked:    speed *= 0.6
             speed = float(np.clip(speed, 0.0, 1.0))
 
-            # 5) 极端阻塞：短促倒退
-            if cover_ratio < FLOOR_HARD_BLOCK:
+            if cover < FLOOR_HARD_BLOCK:
                 motors.drive(REVERSE_SPEED, REVERSE_SPEED)
                 time.sleep(REVERSE_TIME)
                 continue
 
-            # 6) 平滑并映射到左右轮
             steer_cmd = SMOOTH_ALPHA*steer + (1-SMOOTH_ALPHA)*steer_cmd
             speed_cmd = SMOOTH_ALPHA*speed + (1-SMOOTH_ALPHA)*speed_cmd
-            left_out  = np.clip(speed_cmd + STEER_GAIN*(-steer_cmd), -1, 1)
-            right_out = np.clip(speed_cmd + STEER_GAIN*(+steer_cmd), -1, 1)
-            motors.drive(left_out, right_out)
+            left  = np.clip(speed_cmd + STEER_GAIN*(-steer_cmd), -1, 1)
+            right = np.clip(speed_cmd + STEER_GAIN*(+steer_cmd), -1, 1)
+            motors.drive(left, right)
 
-            # 7) 可视化/心跳
             if SHOW_DEBUG:
                 vis = frame.copy()
                 if vis_color is not None: vis = vis_color
@@ -312,12 +228,10 @@ def main():
                 cv2.imshow("debug", vis)
                 if cv2.waitKey(1) & 0xFF == 27: break
             else:
-                now = time.time()
-                if now - last_info > 0.5:
-                    print(f"color={seen_color} area%={area_norm*100:.1f} "
-                          f"cover={cover_ratio*100:.1f}% steer={steer_cmd:+.2f} speed={speed_cmd:.2f}")
-                    last_info = now
-
+                if time.time() - last_info > 0.5:
+                    print(f"seen_color={seen_color} area%={area_norm*100:.1f} cover={cover*100:.1f}% "
+                          f"steer={steer_cmd:+.2f} speed={speed_cmd:.2f}")
+                    last_info = time.time()
     except KeyboardInterrupt:
         print("\n[退出] Ctrl+C")
     finally:
