@@ -5,20 +5,14 @@ This respository is the software we developed for the autonomous driving
 
 Project summary
 
-This project turns a Raspberry Pi 5 with an IMX219 (Pi Camera v2) to make use of computer vision to develop a autonomously-driven car . The software detects specific colors and simultaneously learns the traversable floor appearance to steer toward open space. It outputs left/right wheel commands through PWM into an L298N H-bridge, driving two DC motors. everything runs in Python with OpenCV and Picamera2. 
+This project turns a Raspberry Pi 5 with an IMX219 (Pi Camera v2) to make use of computer vision to develop a autonomously-driven car . The software detects specific colors and simultaneously learns the traversable floor appearance to steer toward open space. It outputs left/right wheel commands through PWM into an Arduino nano board, driving two DC motors. everything runs in Python except Arduino use c++ with OpenCV and Picamera2. 
 
 Hardware & electromechanical mapping
 Compute/controller: Raspberry Pi 5 (runs all perception + control; it is the “controller”).
 Camera: IMX219 via CSI; captured with Picamera2 at e.g. 640×360 @ 30 FPS for low latency.
-Motor driver: L298N dual H-bridge.
+Motor driver:  Arduino nano board+L298N dual H-bridge.
 Motors: Two DC gear motors (differential drive).
 Power: 5 V rail for Pi (stable supply), separate 6–12 V for motors → common ground between Pi GND and L298N GND.
-
-GPIO pin map (BCM numbering):
-Left motor: IN1=20, IN2=21, ENA(PWM)=12
-Right motor: IN3=19, IN4=26, ENB(PWM)=13
-PWM frequency: 1000 Hz (changeable in code).
-Direction: IN1/IN2 (and IN3/IN4) determine forward/reverse; ENA/ENB duty cycle sets speed.
 
 Software architecture (modules & responsibilities)
 IMX219Camera
